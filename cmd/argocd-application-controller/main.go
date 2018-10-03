@@ -24,6 +24,7 @@ import (
 	appclientset "github.com/argoproj/argo-cd/pkg/client/clientset/versioned"
 	"github.com/argoproj/argo-cd/reposerver"
 	"github.com/argoproj/argo-cd/util/cli"
+	"github.com/argoproj/argo-cd/util/kube"
 	"github.com/argoproj/argo-cd/util/stats"
 )
 
@@ -71,6 +72,7 @@ func newCommand() *cobra.Command {
 			appController := controller.NewApplicationController(
 				namespace,
 				kubeClient,
+				kube.KubectlCmd{},
 				appClient,
 				repoClientset,
 				resyncDuration)

@@ -66,17 +66,17 @@ type ApplicationControllerConfig struct {
 func NewApplicationController(
 	namespace string,
 	kubeClientset kubernetes.Interface,
+	kubectl kube.Kubectl,
 	applicationClientset appclientset.Interface,
 	repoClientset reposerver.Clientset,
 	appResyncPeriod time.Duration,
 ) *ApplicationController {
 	db := db.NewDB(namespace, kubeClientset)
-	kubectlCmd := kube.KubectlCmd{}
-	appStateManager := NewAppStateManager(db, applicationClientset, repoClientset, namespace, kubectlCmd)
+	appStateManager := NewAppStateManager(db, applicationClientset, repoClientset, namespace, kubectl)
 	ctrl := ApplicationController{
 		namespace:             namespace,
 		kubeClientset:         kubeClientset,
-		kubectl:               kubectlCmd,
+		kubectl:               kubectl,
 		applicationClientset:  applicationClientset,
 		repoClientset:         repoClientset,
 		appRefreshQueue:       workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter()),
@@ -139,33 +139,39 @@ func (ctrl *ApplicationController) isRefreshForced(appName string) bool {
 	return ok
 }
 
-// watchClusterResources watches for resource changes annotated with application label on specified cluster and schedule corresponding app refresh.
-func (ctrl *ApplicationController) watchClusterResources(ctx context.Context, item appv1.Cluster) {
-	retryUntilSucceed(func() (err error) {
-		defer func() {
-			if r := recover(); r != nil {
-				err = fmt.Errorf("Recovered from panic: %v\n", r)
-			}
-		}()
-		config := item.RESTConfig()
-		ch, err := kube.WatchResourcesWithLabel(ctx, config, "", common.LabelApplicationName)
-		if err != nil {
-			return err
-		}
-		for event := range ch {
-			eventObj := event.Object.(*unstructured.Unstructured)
-			objLabels := eventObj.GetLabels()
-			if objLabels == nil {
-				objLabels = make(map[string]string)
-			}
-			if appName, ok := objLabels[common.LabelApplicationName]; ok {
-				ctrl.forceAppRefresh(appName)
-				ctrl.appRefreshQueue.Add(ctrl.namespace + "/" + appName)
-			}
-		}
-		return fmt.Errorf("resource updates channel has closed")
+func (ctrl *ApplicationController) watchClusterResourcesRetryWrapper(ctx context.Context, item appv1.Cluster) {
+	retryUntilSucceed(func() error {
+		return ctrl.watchClusterResources(ctx, item)
 	}, fmt.Sprintf("watch app resources on %s", item.Server), ctx, watchResourcesRetryTimeout)
+}
 
+// watchClusterResources watches for resource changes annotated with application label on specified cluster and schedule corresponding app refresh.
+func (ctrl *ApplicationController) watchClusterResources(ctx context.Context, item appv1.Cluster) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("Recovered from panic: %v\n", r)
+		}
+	}()
+	config := item.RESTConfig()
+	ch, err := ctrl.kubectl.WatchResourcesWithLabel(ctx, config, "", common.LabelApplicationName)
+	if err != nil {
+		return err
+	}
+	for event := range ch {
+		eventObj := event.Object.(*unstructured.Unstructured)
+		if event.Type == watch.Added && kube.IsCRD(eventObj) {
+			return fmt.Errorf("Restarting the watch because a new CRD was added.")
+		}
+		objLabels := eventObj.GetLabels()
+		if objLabels == nil {
+			objLabels = make(map[string]string)
+		}
+		if appName, ok := objLabels[common.LabelApplicationName]; ok {
+			ctrl.forceAppRefresh(appName)
+			ctrl.appRefreshQueue.Add(ctrl.namespace + "/" + appName)
+		}
+	}
+	return fmt.Errorf("resource updates channel has closed")
 }
 
 func isClusterHasApps(apps []interface{}, cluster *appv1.Cluster) bool {

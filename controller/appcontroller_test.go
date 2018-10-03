@@ -1,12 +1,16 @@
 package controller
 
 import (
+	"context"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/ghodss/yaml"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes/fake"
 
 	argoappv1 "github.com/argoproj/argo-cd/pkg/apis/application/v1alpha1"
@@ -15,13 +19,14 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func newFakeController(apps ...runtime.Object) *ApplicationController {
+func newFakeController(kubectl mockKubectlCmd, apps ...runtime.Object) *ApplicationController {
 	kubeClientset := fake.NewSimpleClientset()
 	appClientset := appclientset.NewSimpleClientset(apps...)
 	repoClientset := reposerver.Clientset{}
 	return NewApplicationController(
 		"argocd",
 		kubeClientset,
+		kubectl,
 		appClientset,
 		&repoClientset,
 		time.Minute,
@@ -76,7 +81,7 @@ func newFakeApp() *argoappv1.Application {
 
 func TestAutoSync(t *testing.T) {
 	app := newFakeApp()
-	ctrl := newFakeController(app)
+	ctrl := newFakeController(mockKubectlCmd{}, app)
 	compRes := argoappv1.ComparisonResult{
 		Status:   argoappv1.ComparisonStatusOutOfSync,
 		Revision: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
@@ -94,7 +99,7 @@ func TestSkipAutoSync(t *testing.T) {
 	// Verify we skip when we previously synced to it in our most recent history
 	// Set current to 'aaaaa', desired to 'aaaa' and mark system OutOfSync
 	app := newFakeApp()
-	ctrl := newFakeController(app)
+	ctrl := newFakeController(mockKubectlCmd{}, app)
 	compRes := argoappv1.ComparisonResult{
 		Status:   argoappv1.ComparisonStatusOutOfSync,
 		Revision: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -107,7 +112,7 @@ func TestSkipAutoSync(t *testing.T) {
 
 	// Verify we skip when we are already Synced (even if revision is different)
 	app = newFakeApp()
-	ctrl = newFakeController(app)
+	ctrl = newFakeController(mockKubectlCmd{}, app)
 	compRes = argoappv1.ComparisonResult{
 		Status:   argoappv1.ComparisonStatusSynced,
 		Revision: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
@@ -121,7 +126,7 @@ func TestSkipAutoSync(t *testing.T) {
 	// Verify we skip when auto-sync is disabled
 	app = newFakeApp()
 	app.Spec.SyncPolicy = nil
-	ctrl = newFakeController(app)
+	ctrl = newFakeController(mockKubectlCmd{}, app)
 	compRes = argoappv1.ComparisonResult{
 		Status:   argoappv1.ComparisonStatusOutOfSync,
 		Revision: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
@@ -144,7 +149,7 @@ func TestSkipAutoSync(t *testing.T) {
 			Revision: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
 		},
 	}
-	ctrl = newFakeController(app)
+	ctrl = newFakeController(mockKubectlCmd{}, app)
 	compRes = argoappv1.ComparisonResult{
 		Status:   argoappv1.ComparisonStatusOutOfSync,
 		Revision: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
@@ -165,7 +170,7 @@ func TestAutoSyncIndicateError(t *testing.T) {
 			Value: "1",
 		},
 	}
-	ctrl := newFakeController(app)
+	ctrl := newFakeController(mockKubectlCmd{}, app)
 	compRes := argoappv1.ComparisonResult{
 		Status:   argoappv1.ComparisonStatusOutOfSync,
 		Revision: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -202,7 +207,7 @@ func TestAutoSyncParameterOverrides(t *testing.T) {
 			Value: "1",
 		},
 	}
-	ctrl := newFakeController(app)
+	ctrl := newFakeController(mockKubectlCmd{}, app)
 	compRes := argoappv1.ComparisonResult{
 		Status:   argoappv1.ComparisonStatusOutOfSync,
 		Revision: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -228,4 +233,74 @@ func TestAutoSyncParameterOverrides(t *testing.T) {
 	app, err := ctrl.applicationClientset.ArgoprojV1alpha1().Applications("argocd").Get("my-app", metav1.GetOptions{})
 	assert.NoError(t, err)
 	assert.NotNil(t, app.Operation)
+}
+
+func TestRetryUntilSucceedSuccessfull(t *testing.T) {
+	refreshRate := 1 * time.Second
+	counter := 0
+	ctx := context.Background()
+	retryUntilSucceed(func() error {
+		if counter > 1 {
+			return nil
+		}
+		counter++
+		return fmt.Errorf("Counter isn't greater than 1")
+	}, "Test Retrying Until Successful return", ctx, refreshRate)
+	assert.Equal(t, 2, counter)
+}
+
+func TestRetryUntilSucceedCancelContext(t *testing.T) {
+	refreshRate := 1 * time.Second
+	ctx := context.Background()
+	go retryUntilSucceed(func() error {
+		return fmt.Errorf("Never return without error")
+	}, "Test Retrying Until Successful return", ctx, refreshRate)
+	ctx.Done()
+}
+
+const crdYaml = `
+apiVersion: apiextensions.k8s.io/v1beta1
+kind: CustomResourceDefinition
+metadata:
+  name: test
+spec:
+  group: example
+  versions:
+    - name: v1
+      served: true
+      storage: true
+  scope: Namespaced
+  names:
+    kind: Test
+`
+
+const crdInstanceYaml = `
+apiVersion: extensions/v1beta1
+kind: Test
+metadata:
+  name: test-instance
+`
+
+func TestWatchClusterResource(t *testing.T) {
+	var crd unstructured.Unstructured
+	err := yaml.Unmarshal([]byte(crdYaml), &crd)
+	assert.NoError(t, err)
+
+	var crdInstance unstructured.Unstructured
+	err = yaml.Unmarshal([]byte(crdInstanceYaml), &crdInstance)
+	assert.NoError(t, err)
+	ch := make(chan watch.Event, 2)
+
+	ch <- watch.Event{Type: watch.Added, Object: &crd}
+	ch <- watch.Event{Type: watch.Added, Object: &crdInstance}
+	close(ch)
+
+	app := newFakeApp()
+	ctrl := newFakeController(mockKubectlCmd{events: ch}, app)
+	ctx := context.Background()
+	err = ctrl.watchClusterResources(ctx, argoappv1.Cluster{})
+	assert.EqualError(t, err, "Restarting the watch because a new CRD was added.")
+	err = ctrl.watchClusterResources(ctx, argoappv1.Cluster{})
+	assert.EqualError(t, err, "resource updates channel has closed")
+
 }

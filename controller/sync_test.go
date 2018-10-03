@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"testing"
@@ -13,6 +14,7 @@ import (
 	apiv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/watch"
 	fakedisco "k8s.io/client-go/discovery/fake"
 	"k8s.io/client-go/rest"
 	testcore "k8s.io/client-go/testing"
@@ -25,6 +27,11 @@ type kubectlOutput struct {
 
 type mockKubectlCmd struct {
 	commands map[string]kubectlOutput
+	events   chan watch.Event
+}
+
+func (k mockKubectlCmd) WatchResourcesWithLabel(ctx context.Context, config *rest.Config, namespace string, labelName string) (chan watch.Event, error) {
+	return k.events, nil
 }
 
 func (k mockKubectlCmd) DeleteResource(config *rest.Config, obj *unstructured.Unstructured, namespace string) error {

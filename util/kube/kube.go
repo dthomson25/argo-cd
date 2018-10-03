@@ -231,60 +231,6 @@ func isExcludedResourceGroup(resource metav1.APIResource) bool {
 	return resource.Group == "servicecatalog.k8s.io"
 }
 
-func WatchResourcesWithLabel(ctx context.Context, config *rest.Config, namespace string, labelName string) (chan watch.Event, error) {
-	log.Infof("Start watching for resources changes with label %s in cluster %s", labelName, config.Host)
-	dynClientPool := dynamic.NewDynamicClientPool(config)
-	disco, err := discovery.NewDiscoveryClientForConfig(config)
-	if err != nil {
-		return nil, err
-	}
-	serverResources, err := GetCachedServerResources(config.Host, disco)
-	if err != nil {
-		return nil, err
-	}
-
-	resources := make([]dynamic.ResourceInterface, 0)
-	for _, apiResourcesList := range serverResources {
-		for i := range apiResourcesList.APIResources {
-			apiResource := apiResourcesList.APIResources[i]
-			watchSupported := false
-			for _, verb := range apiResource.Verbs {
-				if verb == watchVerb {
-					watchSupported = true
-					break
-				}
-			}
-			if watchSupported && !isExcludedResourceGroup(apiResource) {
-				dclient, err := dynClientPool.ClientForGroupVersionKind(schema.FromAPIVersionAndKind(apiResourcesList.GroupVersion, apiResource.Kind))
-				if err != nil {
-					return nil, err
-				}
-				resources = append(resources, dclient.Resource(&apiResource, namespace))
-			}
-		}
-	}
-	ch := make(chan watch.Event)
-	go func() {
-		var wg sync.WaitGroup
-		wg.Add(len(resources))
-		for i := 0; i < len(resources); i++ {
-			resource := resources[i]
-			go func() {
-				defer wg.Done()
-				w, err := resource.Watch(metav1.ListOptions{LabelSelector: labelName})
-				if err == nil {
-					defer w.Stop()
-					copyEventsChannel(ctx, w.ResultChan(), ch)
-				}
-			}()
-		}
-		wg.Wait()
-		close(ch)
-		log.Infof("Stop watching for resources changes with label %s in cluster %s", labelName, config.ServerName)
-	}()
-	return ch, nil
-}
-
 func copyEventsChannel(ctx context.Context, src <-chan watch.Event, dst chan watch.Event) {
 	stopped := false
 	done := make(chan bool)

@@ -41,6 +41,7 @@ import (
 	"github.com/argoproj/argo-cd/util/cache"
 	"github.com/argoproj/argo-cd/util/db"
 	"github.com/argoproj/argo-cd/util/git"
+	"github.com/argoproj/argo-cd/util/kube"
 	"github.com/argoproj/argo-cd/util/rbac"
 	"github.com/argoproj/argo-cd/util/settings"
 )
@@ -311,6 +312,7 @@ func (f *Fixture) createController() *controller.ApplicationController {
 	return controller.NewApplicationController(
 		f.Namespace,
 		f.KubeClient,
+		kube.KubectlCmd{},
 		f.AppClient,
 		reposerver.NewRepositoryServerClientset(f.RepoServerAddress),
 		10*time.Second)
