@@ -16,10 +16,12 @@ import (
 	appv1 "github.com/argoproj/argo-cd/pkg/apis/application/v1alpha1"
 	hookutil "github.com/argoproj/argo-cd/util/hook"
 	"github.com/argoproj/argo-cd/util/kube"
+	"github.com/argoproj/argo-cd/util/lua"
+	"github.com/argoproj/argo-cd/util/settings"
 )
 
 // SetApplicationHealth updates the health statuses of all resources performed in the comparison
-func SetApplicationHealth(resStatuses []appv1.ResourceStatus, liveObjs []*unstructured.Unstructured) (*appv1.HealthStatus, error) {
+func SetApplicationHealth(resStatuses []appv1.ResourceStatus, liveObjs []*unstructured.Unstructured, resourceOverrides map[string]settings.ResourceOverride) (*appv1.HealthStatus, error) {
 	var savedErr error
 	appHealth := appv1.HealthStatus{Status: appv1.HealthStatusHealthy}
 	for i, liveObj := range liveObjs {
@@ -28,7 +30,7 @@ func SetApplicationHealth(resStatuses []appv1.ResourceStatus, liveObjs []*unstru
 		if liveObj == nil {
 			resHealth = &appv1.HealthStatus{Status: appv1.HealthStatusMissing}
 		} else {
-			resHealth, err = GetResourceHealth(liveObj)
+			resHealth, err = GetResourceHealth(liveObj, resourceOverrides)
 			if err != nil && savedErr == nil {
 				savedErr = err
 			}
@@ -44,9 +46,21 @@ func SetApplicationHealth(resStatuses []appv1.ResourceStatus, liveObjs []*unstru
 }
 
 // GetResourceHealth returns the health of a k8s resource
-func GetResourceHealth(obj *unstructured.Unstructured) (*appv1.HealthStatus, error) {
+func GetResourceHealth(obj *unstructured.Unstructured, resourceOverrides map[string]settings.ResourceOverride) (*appv1.HealthStatus, error) {
 	var err error
 	var health *appv1.HealthStatus
+
+	health, err = getResourceHealthFromLuaScript(obj, resourceOverrides)
+	if err != nil {
+		health = &appv1.HealthStatus{
+			Status:  appv1.HealthStatusUnknown,
+			Message: err.Error(),
+		}
+		return health, err
+	}
+	if health != nil {
+		return health, nil
+	}
 
 	gvk := obj.GroupVersionKind()
 	switch gvk.Group {
@@ -111,6 +125,24 @@ func IsWorse(current, new appv1.HealthStatusCode) bool {
 		}
 	}
 	return newIndex > currentIndex
+}
+
+func getResourceHealthFromLuaScript(obj *unstructured.Unstructured, resourceOverrides map[string]settings.ResourceOverride) (*appv1.HealthStatus, error) {
+	luaVM := lua.VM{
+		ResourceOverrides: resourceOverrides,
+	}
+	script, err := luaVM.GetHealthScript(obj)
+	if err != nil {
+		return nil, err
+	}
+	if script == "" {
+		return nil, nil
+	}
+	result, err := luaVM.ExecuteHealthLua(obj, script)
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 func getPVCHealth(obj *unstructured.Unstructured) (*appv1.HealthStatus, error) {
